@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0ea5e9" />
+  <title>Medição de Som (Android + Chrome)</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0b1220;
+      --card: #111827;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #0ea5e9;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --ok: #10b981;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      background: linear-gradient(180deg, #0b1220 0%, #0b1220 40%, #0a0f1a 100%);
+      color: var(--text); min-height: 100dvh; display: grid; place-items: center; padding: 16px;
+    }
+    .card {
+      width: 100%; max-width: 720px; background: rgba(17,24,39,0.85);
+      border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; padding: 20px; backdrop-filter: blur(6px);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 8px; }
+    p { color: var(--muted); margin: 0 0 16px; }
+    .controls { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    button, input[type="number"] {
+      appearance: none; border: 1px solid rgba(255,255,255,0.12); background: #0f172a; color: var(--text);
+      padding: 10px 14px; border-radius: 10px; font-weight: 600;
+    }
+    button.primary { background: var(--accent); color: #001219; border-color: rgba(255,255,255,0.0); }
+    button:disabled { opacity: 0.6; }
+    .grid {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px;
+    }
+    .metric {
+      background: #0c1526; border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 12px;
+    }
+    .metric .label { color: var(--muted); font-size: 0.85rem; }
+    .metric .value { font-size: 1.75rem; font-variant-numeric: tabular-nums; margin-top: 2px; }
+    .bar {
+      height: 20px; background: #0c1526; border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; overflow: hidden;
+      margin: 8px 0 2px;
+    }
+    .bar > div { height: 100%; width: 0%; background: linear-gradient(90deg, var(--ok), var(--warning), var(--danger)); transition: width 80ms linear; }
+    .hint { color: var(--muted); font-size: 0.85rem; }
+    canvas { width: 100%; height: 140px; background: #0b1220; border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .row label { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Medição de som (Android + Chrome)</h1>
+    <p>Toque em “Iniciar medição”, permita o microfone e mantenha a tela ligada para leituras contínuas.</p>
+
+    <div class="controls">
+      <button id="startBtn" class="primary">Iniciar medição</button>
+      <button id="stopBtn" disabled>Parar</button>
+      <div class="row">
+        <label for="cal">Offset de calibração (dB):</label>
+        <input id="cal" type="number" step="0.1" value="0" style="width: 100px;" />
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="metric">
+        <div class="label">Nível atual</div>
+        <div id="currentDb" class="value">— dBFS</div>
+        <div class="bar"><div id="barFill"></div></div>
+        <div class="hint">dBFS (0 é o teto digital; valores negativos são mais baixos)</div>
+      </div>
+      <div class="metric">
+        <div class="label">Máximo</div>
+        <div id="maxDb" class="value">— dBFS</div>
+        <div class="hint">Desde que iniciou a sessão</div>
+      </div>
+      <div class="metric">
+        <div class="label">Média</div>
+        <div id="avgDb" class="value">— dBFS</div>
+        <div class="hint">Média móvel ~1s</div>
+      </div>
+    </div>
+
+    <canvas id="scope" width="800" height="200" aria-label="Forma de onda"></canvas>
+    <p class="hint">Dicas: desative reduções de ruído pelo botão acima. Em Android, o Chrome só permite acesso ao microfone em sites HTTPS.</p>
+    <p id="status" class="hint"></p>
+  </main>
+
+  <script>
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn  = document.getElementById('stopBtn');
+    const currentDbEl = document.getElementById('currentDb');
+    const maxDbEl = document.getElementById('maxDb');
+    const avgDbEl = document.getElementById('avgDb');
+    const barFill = document.getElementById('barFill');
+    const statusEl = document.getElementById('status');
+    const calInput = document.getElementById('cal');
+    const scope = document.getElementById('scope');
+    const ctx2d = scope.getContext('2d');
+
+    let audioCtx, analyser, micSource, mediaStream;
+    let rafId, drawId, timerId;
+    let buf, maxDb = -Infinity, avgDb = -Infinity;
+    let running = false;
+
+    const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
+
+    function fmtDb(x) {
+      if (!isFinite(x)) return '-8 dBFS';
+      return x.toFixed(1) + ' dBFS';
+    }
+
+    function setStatus(msg) { statusEl.textContent = msg || ''; }
+
+    function drawWaveform() {
+      if (!running || !analyser) return;
+      analyser.getFloatTimeDomainData(buf);
+
+      ctx2d.fillStyle = '#0b1220';
+      ctx2d.fillRect(0, 0, scope.width, scope.height);
+      ctx2d.strokeStyle = '#0ea5e9';
+      ctx2d.lineWidth = 2;
+      ctx2d.beginPath();
+
+      const mid = scope.height / 2;
+      for (let i = 0; i < buf.length; i++) {
+        const x = i / (buf.length - 1) * scope.width;
+        const y = mid + buf[i] * mid * 0.9;
+        if (i === 0) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
+      }
+      ctx2d.stroke();
+
+      drawId = requestAnimationFrame(drawWaveform);
+    }
+
+    function startMeter() {
+      if (running) return;
+      running = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      setStatus('Solicitando acesso ao microfone...');
+
+      const constraints = {
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1
+        }
+      };
+
+      navigator.mediaDevices.getUserMedia(constraints)
+        .then(async (stream) => {
+          mediaStream = stream;
+
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+          if (audioCtx.state === 'suspended') {
+            try { await audioCtx.resume(); } catch {}
+          }
+
+          micSource = audioCtx.createMediaStreamSource(stream);
+          analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 2048;
+          analyser.smoothingTimeConstant = 0.0; // medição bruta por quadro
+          buf = new Float32Array(analyser.fftSize);
+
+          micSource.connect(analyser);
+
+          maxDb = -Infinity;
+          avgDb = -Infinity;
+
+          // Loop de medição
+          timerId = setInterval(() => {
+            if (!analyser) return;
+            analyser.getFloatTimeDomainData(buf);
+
+            // RMS
+            let sum = 0;
+            for (let i = 0; i < buf.length; i++) {
+              const s = buf[i];
+              sum += s * s;
+            }
+            const rms = Math.sqrt(sum / buf.length);
+
+            // Evita -Infinity
+            const minRms = 1e-8;
+            let db = 20 * Math.log10(Math.max(rms, minRms));
+
+            // Offset de calibração (opcional)
+            const cal = parseFloat(calInput.value || '0');
+            if (isFinite(cal)) db += cal;
+
+            // Atualiza métricas
+            maxDb = Math.max(maxDb, db);
+            if (!isFinite(avgDb)) avgDb = db;
+            // média móvel simples ~1s
+            const alpha = 0.1;
+            avgDb = (1 - alpha) * avgDb + alpha * db;
+
+            // UI
+            currentDbEl.textContent = fmtDb(db);
+            maxDbEl.textContent = fmtDb(maxDb);
+            avgDbEl.textContent = fmtDb(avgDb);
+
+            // Barra: 0 dBFS é 100%, -60 dBFS ~ 0%
+            const percent = clamp((db + 60) / 60 * 100, 0, 100);
+            barFill.style.width = percent.toFixed(1) + '%';
+          }, 50);
+
+          drawId = requestAnimationFrame(drawWaveform);
+
+          setStatus('Medição em andamento. Mantenha o dispositivo parado para leituras consistentes.');
+        })
+        .catch((err) => {
+          console.error(err);
+          running = false;
+          startBtn.disabled = false;
+          stopBtn.disabled = true;
+          let msg = 'Não foi possível acessar o microfone.';
+          if (location.protocol !== 'https:') {
+            msg += ' Acesso ao microfone exige HTTPS no Chrome para Android.';
+          }
+          setStatus(msg + ' Dica: verifique permissões do site nas configurações do Chrome.');
+        });
+    }
+
+    function stopMeter() {
+      running = false;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      setStatus('Medição pausada.');
+      if (timerId) { clearInterval(timerId); timerId = null; }
+      if (drawId) { cancelAnimationFrame(drawId); drawId = null; }
+      try { if (analyser) analyser.disconnect(); } catch {}
+      try { if (micSource) micSource.disconnect(); } catch {}
+      try {
+        if (mediaStream) {
+          mediaStream.getTracks().forEach(t => t.stop());
+          mediaStream = null;
+        }
+      } catch {}
+      try { if (audioCtx) { audioCtx.close(); audioCtx = null; } } catch {}
+      analyser = null;
+      micSource = null;
+    }
+
+    startBtn.addEventListener('click', startMeter);
+    stopBtn.addEventListener('click', stopMeter);
+
+    // Boa prática: parar ao sair da página
+    window.addEventListener('pagehide', stopMeter);
+    window.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') stopMeter();
+    });
+  </script>
+</body>
+</html>
